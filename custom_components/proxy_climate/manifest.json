@@ -1,0 +1,11 @@
+{
+  "domain": "proxy_climate",
+  "name": "Proxy Climate",
+  "codeowners": ["@Irame"],
+  "dependencies": [],
+  "documentation": "https://github.com/Irame/ha-proxy-climate",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/Irame/ha-proxy-climate/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

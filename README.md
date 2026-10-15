@@ -79,9 +79,9 @@ The fan-speed options of the AC variant (`source_fan_modes`, `fan_step`, `fan_mo
 
 "Demand" is how far the room is from the target in the direction that needs work: `target − room` when heating, `room − target` when cooling. It's shown as the `demand` attribute on the proxy entity.
 
-The device starts when demand reaches `start_offset` and stops when demand falls to `−stop_offset`, i.e. once the room has overshot the target. Between those points it keeps doing whatever it was doing, which is the deadband. `min_cycle_duration` additionally enforces a minimum on-time and off-time; user actions like changing the HVAC mode bypass it.
+The device starts when demand reaches `start_offset` and stops when demand falls to `−stop_offset`, i.e. once the room has overshot the target. Between those points it keeps doing whatever it was doing, which is the deadband. `min_cycle_duration` additionally enforces a minimum on-time and off-time; changing the HVAC mode bypasses it, re-sending the current one (as voice assistants often do) doesn't.
 
-A switch source is simply on while running and off while idle. With the defaults and a 21° heating target, it switches on at 20.5° and off again at 21.5°.
+A switch source is simply on while running and off while idle. With the defaults and a 21° heating target, it switches on at 20.5° and off again at 21.5°. The proxy's `hvac_action` follows the switch itself, so it shows idle whenever the plug is actually off or unreachable.
 
 While running, an AC gets `heat_setpoint` / `cool_setpoint` and a fan level of `floor(demand / fan_step)`, clamped to the available levels, then shifted by the proxy fan mode's offset. With the defaults, a 21° heating target and the medium proxy fan mode:
 
@@ -102,7 +102,7 @@ When idle, `idle_action` decides what the AC does: `turn_off` switches it off, `
 
 ## Notes
 
-While the proxy is in heat or cool, it owns the device: anything changed with the IR remote, or by flipping the switch by hand, gets corrected on the next `control_interval` tick. When you turn the proxy off it switches the device off once and then leaves it alone.
+While the proxy is in heat or cool, it owns the device: anything changed with the IR remote, or by flipping the switch by hand, gets corrected on the next `control_interval` tick. When you turn the proxy off it switches the device off once (as soon as it is reachable again, if it was offline at that moment) and then leaves it alone.
 
 If the room sensor becomes unavailable, the proxy goes idle until readings come back, so the device is never left running without feedback.
 

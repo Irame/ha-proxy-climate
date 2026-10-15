@@ -49,6 +49,7 @@ from homeassistant.core import (
     State,
     split_entity_id,
 )
+from homeassistant.exceptions import ServiceValidationError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
@@ -236,6 +237,7 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         self._active = False  # True while heating/cooling (inside the deadband cycle)
         self._last_switch: datetime | None = None
         self._demand: float | None = None
+        self._pending_off = False  # turn-off that hasn't reached the source yet
         self._started = False
         self._lock = asyncio.Lock()
 
@@ -338,10 +340,11 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         if mode == HVACMode.OFF:
             self._set_active(False)
             self._demand = None
-            # Only switch the source off when the user turns the proxy off;
-            # afterwards the source is left alone (remote etc. still works).
-            if force:
-                await self._async_source_off()
+            # Only switch the source off when the user turns the proxy off
+            # (retried until the source is reachable); afterwards the source
+            # is left alone (remote etc. still works).
+            if force or self._pending_off:
+                self._pending_off = not await self._async_source_off()
             return
 
         cur = self._attr_current_temperature
@@ -392,8 +395,11 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
 
     # --------------------------------------------------------- source control
 
-    async def _async_source_off(self) -> None:
-        """Switch the source off because the user turned the proxy off."""
+    async def _async_source_off(self) -> bool:
+        """Switch the source off because the user turned the proxy off.
+
+        Returns False if the source couldn't be reached, so it gets retried.
+        """
         raise NotImplementedError
 
     async def _async_source_idle(self, mode: HVACMode) -> None:
@@ -404,7 +410,11 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         """Run the source in `mode` for the given demand."""
         raise NotImplementedError
 
-    async def _async_call(self, service: str, data: dict[str, Any]) -> None:
+    def _is_running(self) -> bool:
+        """Whether the source is heating/cooling right now."""
+        return self._active
+
+    async def _async_call(self, service: str, data: dict[str, Any]) -> bool:
         domain = self._source_domain
         _LOGGER.debug("%s -> %s.%s %s", self.entity_id, domain, service, data)
         try:
@@ -418,6 +428,8 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
                 self._source,
                 err,
             )
+            return False
+        return True
 
     # ------------------------------------------------------------ entity API
 
@@ -425,7 +437,7 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
     def hvac_action(self) -> HVACAction:
         if self._attr_hvac_mode == HVACMode.OFF:
             return HVACAction.OFF
-        if not self._active:
+        if not self._is_running():
             return HVACAction.IDLE
         if self._attr_hvac_mode == HVACMode.HEAT:
             return HVACAction.HEATING
@@ -439,21 +451,36 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         }
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        if hvac_mode != self._attr_hvac_mode:
+        self._check_hvac_mode(hvac_mode)
+        changed = hvac_mode != self._attr_hvac_mode
+        if changed:
             # A running cycle belongs to the previous mode.
             self._set_active(False)
         self._attr_hvac_mode = hvac_mode
         if hvac_mode != HVACMode.OFF:
             self._last_on_mode = hvac_mode
-        await self._async_control(force=True)
+        # Re-sending the current mode must not skip min_cycle_duration, but
+        # "off" always goes through so it also stops a source switched on by hand.
+        await self._async_control(force=changed or hvac_mode == HVACMode.OFF)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        if (mode := kwargs.get(ATTR_HVAC_MODE)) is not None:
+            # HA doesn't validate this hvac_mode; check it before the target
+            # changes so a rejected call has no effect at all.
+            self._check_hvac_mode(HVACMode(mode))
         if (temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
             self._attr_target_temperature = float(temp)
-        if (mode := kwargs.get(ATTR_HVAC_MODE)) is not None:
+        if mode is not None:
             await self.async_set_hvac_mode(HVACMode(mode))
         else:
             await self._async_control()
+
+    def _check_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        if hvac_mode not in self._attr_hvac_modes:
+            raise ServiceValidationError(
+                f"{self.entity_id} does not support hvac mode {hvac_mode} "
+                f"(supported: {', '.join(self._attr_hvac_modes)})"
+            )
 
     async def async_turn_on(self) -> None:
         await self.async_set_hvac_mode(self._last_on_mode)
@@ -549,9 +576,9 @@ class ProxyClimate(BaseProxyClimate):
 
     # --------------------------------------------------------- source control
 
-    async def _async_source_off(self) -> None:
+    async def _async_source_off(self) -> bool:
         self._source_fan = None
-        await self._async_apply_source(HVACMode.OFF)
+        return await self._async_apply_source(HVACMode.OFF)
 
     async def _async_source_active(self, mode: HVACMode, demand: float) -> None:
         level = self._fan_level(demand)
@@ -596,15 +623,21 @@ class ProxyClimate(BaseProxyClimate):
         hvac_mode: HVACMode,
         temperature: float | None = None,
         fan_mode: str | None = None,
-    ) -> None:
-        """Send only the commands whose value differs from the source's state."""
+    ) -> bool:
+        """Send only the commands whose value differs from the source's state.
+
+        Returns whether the source was reachable and every command succeeded.
+        """
         state = self.hass.states.get(self._source)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            return
+            return False
         base = {ATTR_ENTITY_ID: self._source}
+        ok = True
 
         if state.state != hvac_mode:
-            await self._async_call("set_hvac_mode", {**base, ATTR_HVAC_MODE: hvac_mode})
+            ok &= await self._async_call(
+                "set_hvac_mode", {**base, ATTR_HVAC_MODE: hvac_mode}
+            )
 
         if temperature is not None:
             current_sp = state.attributes.get(ATTR_TEMPERATURE)
@@ -613,12 +646,15 @@ class ProxyClimate(BaseProxyClimate):
             except (TypeError, ValueError):
                 same = False
             if not same:
-                await self._async_call(
+                ok &= await self._async_call(
                     "set_temperature", {**base, ATTR_TEMPERATURE: temperature}
                 )
 
         if fan_mode is not None and state.attributes.get(ATTR_FAN_MODE) != fan_mode:
-            await self._async_call("set_fan_mode", {**base, ATTR_FAN_MODE: fan_mode})
+            ok &= await self._async_call(
+                "set_fan_mode", {**base, ATTR_FAN_MODE: fan_mode}
+            )
+        return ok
 
     # ------------------------------------------------------------ entity API
 
@@ -643,8 +679,12 @@ class SwitchProxyClimate(BaseProxyClimate):
     def __init__(self, hass: HomeAssistant, config: ConfigType) -> None:
         super().__init__(hass, config, [HVACMode(config[CONF_HVAC_MODE])])
 
-    async def _async_source_off(self) -> None:
-        await self._async_switch(False)
+    async def _async_source_changed(self, event: Event[EventStateChangedData]) -> None:
+        await super()._async_source_changed(event)
+        self.async_write_ha_state()  # hvac_action follows the switch
+
+    async def _async_source_off(self) -> bool:
+        return await self._async_switch(False)
 
     async def _async_source_active(self, mode: HVACMode, demand: float) -> None:
         await self._async_switch(True)
@@ -652,15 +692,25 @@ class SwitchProxyClimate(BaseProxyClimate):
     async def _async_source_idle(self, mode: HVACMode) -> None:
         await self._async_switch(False)
 
-    async def _async_switch(self, on: bool) -> None:
-        """Switch the source unless it is already in that state."""
+    async def _async_switch(self, on: bool) -> bool:
+        """Switch the source unless it is already in that state.
+
+        Returns whether the source was reachable and the command succeeded.
+        """
         state = self.hass.states.get(self._source)
         if state is None or state.state == STATE_UNAVAILABLE:
-            return
+            return False
         # An unknown state still gets the command, so a heater whose plug
         # hasn't reported yet isn't left running.
-        if state.state != (STATE_ON if on else STATE_OFF):
-            await self._async_call(
-                SERVICE_TURN_ON if on else SERVICE_TURN_OFF,
-                {ATTR_ENTITY_ID: self._source},
-            )
+        if state.state == (STATE_ON if on else STATE_OFF):
+            return True
+        return await self._async_call(
+            SERVICE_TURN_ON if on else SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: self._source},
+        )
+
+    def _is_running(self) -> bool:
+        # Report what the switch is actually doing, not what the proxy asked
+        # for, so an unreachable plug or a failed command shows up as idle.
+        state = self.hass.states.get(self._source)
+        return state is not None and state.state == STATE_ON

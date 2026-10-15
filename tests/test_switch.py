@@ -9,6 +9,7 @@ from pytest_homeassistant_custom_component.common import (
 )
 
 from homeassistant.core import CoreState, State
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
@@ -51,6 +52,13 @@ async def _flip(hass, service):
     await hass.services.async_call(
         "switch", service, {"entity_id": "switch.heater"}, blocking=True
     )
+    await hass.async_block_till_done()
+
+
+async def _reachable(hass, fake_switch, available):
+    """Let the plug drop off / come back to the network."""
+    fake_switch._attr_available = available
+    fake_switch.async_write_ha_state()
     await hass.async_block_till_done()
 
 
@@ -121,6 +129,64 @@ async def test_min_cycle(hass, fake_switch, freezer):
     assert _switch(hass) == "on"
 
 
+async def test_resent_mode_keeps_min_cycle(hass, fake_switch):
+    await _setup(hass, min_cycle_duration={"minutes": 5})
+    await _call(hass, "set_hvac_mode", hvac_mode="heat")
+    await _room(hass, 20.0)
+    await _room(hass, 21.6)
+    assert _switch(hass) == "on"
+    # Voice assistants and automations often re-send the current mode.
+    await _call(hass, "set_hvac_mode", hvac_mode="heat")
+    await _call(hass, "set_temperature", temperature=21, hvac_mode="heat")
+    await _call(hass, "turn_on")
+    assert _switch(hass) == "on", "min on-time still applies"
+
+
+async def test_unsupported_mode_rejected(hass, fake_switch):
+    await _setup(hass)  # heat-only
+    await _call(hass, "set_hvac_mode", hvac_mode="heat")
+    await _room(hass, 23)
+    for service, data in (
+        ("set_hvac_mode", {"hvac_mode": "cool"}),
+        ("set_temperature", {"temperature": 22, "hvac_mode": "cool"}),
+    ):
+        with pytest.raises(ServiceValidationError):
+            await _call(hass, service, **data)
+    proxy = _proxy(hass)
+    assert (proxy.state, proxy.attributes["temperature"]) == ("heat", 21)
+    assert _switch(hass) == "off"
+
+
+async def test_off_while_unreachable(hass, fake_switch):
+    await _setup(hass)
+    await _call(hass, "set_hvac_mode", hvac_mode="heat")
+    await _room(hass, 20.0)
+    assert _switch(hass) == "on"
+    await _reachable(hass, fake_switch, False)
+    await _call(hass, "turn_off")
+    await _reachable(hass, fake_switch, True)
+    assert _switch(hass) == "off", "turn-off is delivered once the plug is back"
+    # After that the plug is left alone again.
+    await _flip(hass, "turn_on")
+    await _tick(hass)
+    assert _switch(hass) == "on"
+
+
+async def test_hvac_action_follows_switch(hass, fake_switch):
+    await _setup(hass)
+    await _call(hass, "set_hvac_mode", hvac_mode="heat")
+    await _room(hass, 20.0)
+    assert _proxy(hass).attributes["hvac_action"] == "heating"
+    await _reachable(hass, fake_switch, False)
+    assert _proxy(hass).attributes["hvac_action"] == "idle"
+    await _reachable(hass, fake_switch, True)
+    assert _proxy(hass).attributes["hvac_action"] == "heating"
+    await _flip(hass, "turn_off")
+    assert _proxy(hass).attributes["hvac_action"] == "idle"
+    await _tick(hass)
+    assert _proxy(hass).attributes["hvac_action"] == "heating"
+
+
 async def test_off_sensor_loss_and_manual_switching(hass, fake_switch):
     await _setup(hass)
     await _call(hass, "set_hvac_mode", hvac_mode="heat")
@@ -139,10 +205,13 @@ async def test_off_sensor_loss_and_manual_switching(hass, fake_switch):
 
     await _call(hass, "turn_off")
     assert _switch(hass) == "off"
-    # When the proxy is off, the switch is left alone.
+    # When the proxy is off, the switch is left alone...
     await _flip(hass, "turn_on")
     await _tick(hass)
     assert _switch(hass) == "on"
+    # ...until the proxy is told "off" again.
+    await _call(hass, "turn_off")
+    assert _switch(hass) == "off"
     await _room(hass, 22)
     await _call(hass, "turn_on")
     assert _proxy(hass).state == "heat"

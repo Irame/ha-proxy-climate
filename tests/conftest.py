@@ -1,4 +1,5 @@
-"""Test fixtures: a fake AC climate platform the proxy can drive."""
+"""Test fixtures: a fake AC climate platform and a fake heater switch the
+proxy can drive."""
 
 import pytest
 from pytest_homeassistant_custom_component.common import (
@@ -13,6 +14,7 @@ from homeassistant.components.climate import (
     ClimateEntityFeature,
     HVACMode,
 )
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 
 pytest_plugins = "pytest_homeassistant_custom_component"
@@ -64,6 +66,39 @@ class FakeAC(ClimateEntity):
         await self.async_set_hvac_mode(HVACMode.OFF)
 
 
+class FakeSwitch(SwitchEntity):
+    """Smart plug for a space heater that records every command it receives."""
+
+    _attr_name = "Heater"
+    _attr_should_poll = False
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._attr_is_on = False
+
+    async def async_turn_on(self, **kwargs):
+        self.calls.append("on")
+        self._attr_is_on = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs):
+        self.calls.append("off")
+        self._attr_is_on = False
+        self.async_write_ha_state()
+
+
+def _register(hass, integration: str, domain: str, entity) -> None:
+    """Register an `integration` that sets up `entity` on its `domain` platform."""
+
+    async def _setup_platform(hass, config, async_add_entities, discovery_info=None):
+        async_add_entities([entity])
+
+    mock_integration(hass, MockModule(integration))
+    mock_platform(
+        hass, f"{integration}.{domain}", MockPlatform(async_setup_platform=_setup_platform)
+    )
+
+
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations):
     """Load integrations from custom_components/ in every test."""
@@ -74,10 +109,13 @@ def auto_enable_custom_integrations(enable_custom_integrations):
 def fake_ac(hass) -> FakeAC:
     """Register a `fake_ac` climate platform that provides climate.ac."""
     entity = FakeAC()
+    _register(hass, "fake_ac", "climate", entity)
+    return entity
 
-    async def _setup_platform(hass, config, async_add_entities, discovery_info=None):
-        async_add_entities([entity])
 
-    mock_integration(hass, MockModule("fake_ac"))
-    mock_platform(hass, "fake_ac.climate", MockPlatform(async_setup_platform=_setup_platform))
+@pytest.fixture
+def fake_switch(hass) -> FakeSwitch:
+    """Register a `fake_switch` switch platform that provides switch.heater."""
+    entity = FakeSwitch()
+    _register(hass, "fake_switch", "switch", entity)
     return entity

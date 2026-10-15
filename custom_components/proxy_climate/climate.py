@@ -1,13 +1,16 @@
-"""Proxy climate entity.
+"""Proxy climate entities.
 
-Wraps an existing climate entity (the "source", e.g. an AC / heat pump) and:
+Both kinds read the room temperature from a different entity (sensor or
+climate) and use a deadband (start/stop offsets) plus an optional minimum cycle
+time so the source doesn't switch on and off too often. The domain of the
+`source` entity decides how it is driven:
 
-* reads the room temperature from a different entity (sensor or climate),
-* runs the source at a fixed extreme setpoint while active and modulates its
-  output through the source's fan speed, proportional to how far the room is
-  from the target, shifted by the proxy's own low/medium/high fan setting,
-* uses a deadband (start/stop offsets) plus an optional minimum cycle time so
-  the source doesn't switch on and off too often.
+* climate (e.g. an AC / heat pump): runs the source at a fixed extreme setpoint
+  while active and modulates its output through the source's fan speed,
+  proportional to how far the room is from the target, shifted by the proxy's
+  own low/medium/high fan setting,
+* switch / input_boolean (e.g. a space heater or cooler on a smart plug):
+  switches the source on while active and off while idle.
 """
 
 from __future__ import annotations
@@ -32,10 +35,20 @@ from homeassistant.const import (
     ATTR_TEMPERATURE,
     CONF_NAME,
     CONF_UNIQUE_ID,
+    SERVICE_TURN_OFF,
+    SERVICE_TURN_ON,
+    STATE_OFF,
+    STATE_ON,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import Event, EventStateChangedData, HomeAssistant, State
+from homeassistant.core import (
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    split_entity_id,
+)
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
@@ -53,6 +66,7 @@ CONF_SOURCE = "source"
 CONF_SENSOR = "sensor"
 CONF_SOURCE_FAN_MODES = "source_fan_modes"
 CONF_HVAC_MODES = "hvac_modes"
+CONF_HVAC_MODE = "hvac_mode"
 CONF_HEAT_SETPOINT = "heat_setpoint"
 CONF_COOL_SETPOINT = "cool_setpoint"
 CONF_START_OFFSET = "start_offset"
@@ -67,6 +81,9 @@ CONF_TARGET_TEMP = "target_temp"
 CONF_MIN_TEMP = "min_temp"
 CONF_MAX_TEMP = "max_temp"
 CONF_TEMP_STEP = "target_temp_step"
+
+# Source domains that are plain on/off devices.
+SWITCH_DOMAINS = ["switch", "input_boolean"]
 
 IDLE_TURN_OFF = "turn_off"
 IDLE_FAN_ONLY = "fan_only"
@@ -84,12 +101,32 @@ DEFAULT_FAN_OFFSETS = {"low": -1, "medium": 0, "high": 1}
 _FLOAT = vol.Coerce(float)
 _NON_NEG_FLOAT = vol.All(vol.Coerce(float), vol.Range(min=0))
 
-PLATFORM_SCHEMA = CLIMATE_PLATFORM_SCHEMA.extend(
+# Options shared by every source type.
+_COMMON_SCHEMA = CLIMATE_PLATFORM_SCHEMA.extend(
     {
         vol.Optional(CONF_NAME, default="Proxy Climate"): cv.string,
         vol.Optional(CONF_UNIQUE_ID): cv.string,
-        vol.Required(CONF_SOURCE): cv.entity_domain("climate"),
         vol.Required(CONF_SENSOR): cv.entity_id,
+        # Deadband: start when the room is `start_offset` on the wrong side of
+        # the target, stop once it has overshot the target by `stop_offset`.
+        vol.Optional(CONF_START_OFFSET, default=0.5): _NON_NEG_FLOAT,
+        vol.Optional(CONF_STOP_OFFSET, default=0.5): _NON_NEG_FLOAT,
+        vol.Optional(CONF_MIN_CYCLE, default=timedelta(0)): cv.positive_time_period,
+        vol.Optional(CONF_INTERVAL, default=timedelta(seconds=60)): vol.All(
+            cv.time_period, vol.Range(min=timedelta(seconds=10))
+        ),
+        vol.Optional(CONF_TARGET_TEMP, default=21.0): _FLOAT,
+        vol.Optional(CONF_MIN_TEMP, default=16.0): _FLOAT,
+        vol.Optional(CONF_MAX_TEMP, default=30.0): _FLOAT,
+        vol.Optional(CONF_TEMP_STEP, default=0.5): vol.All(
+            vol.Coerce(float), vol.Range(min=0.1)
+        ),
+    }
+)
+
+CLIMATE_SOURCE_SCHEMA = _COMMON_SCHEMA.extend(
+    {
+        vol.Required(CONF_SOURCE): cv.entity_domain("climate"),
         # Source fan speeds ordered weakest -> strongest, spelled exactly as
         # the source entity reports them in its `fan_modes` attribute.
         vol.Required(CONF_SOURCE_FAN_MODES): vol.All(
@@ -106,10 +143,6 @@ PLATFORM_SCHEMA = CLIMATE_PLATFORM_SCHEMA.extend(
         # Default: the source's own max_temp / min_temp.
         vol.Optional(CONF_HEAT_SETPOINT): _FLOAT,
         vol.Optional(CONF_COOL_SETPOINT): _FLOAT,
-        # Deadband: start when the room is `start_offset` on the wrong side of
-        # the target, stop once it has overshot the target by `stop_offset`.
-        vol.Optional(CONF_START_OFFSET, default=0.5): _NON_NEG_FLOAT,
-        vol.Optional(CONF_STOP_OFFSET, default=0.5): _NON_NEG_FLOAT,
         # One source fan level per `fan_step` degrees of demand.
         vol.Optional(CONF_FAN_STEP, default=0.5): vol.All(
             vol.Coerce(float), vol.Range(min=0.1)
@@ -123,18 +156,34 @@ PLATFORM_SCHEMA = CLIMATE_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_IDLE_ACTION, default=IDLE_TURN_OFF): vol.In(
             [IDLE_TURN_OFF, IDLE_FAN_ONLY, IDLE_HOLD_SETPOINT]
         ),
-        vol.Optional(CONF_MIN_CYCLE, default=timedelta(0)): cv.positive_time_period,
-        vol.Optional(CONF_INTERVAL, default=timedelta(seconds=60)): vol.All(
-            cv.time_period, vol.Range(min=timedelta(seconds=10))
-        ),
-        vol.Optional(CONF_TARGET_TEMP, default=21.0): _FLOAT,
-        vol.Optional(CONF_MIN_TEMP, default=16.0): _FLOAT,
-        vol.Optional(CONF_MAX_TEMP, default=30.0): _FLOAT,
-        vol.Optional(CONF_TEMP_STEP, default=0.5): vol.All(
-            vol.Coerce(float), vol.Range(min=0.1)
+    }
+)
+
+SWITCH_SOURCE_SCHEMA = _COMMON_SCHEMA.extend(
+    {
+        vol.Required(CONF_SOURCE): cv.entity_domain(SWITCH_DOMAINS),
+        # What the device does while it is switched on.
+        vol.Optional(CONF_HVAC_MODE, default=HVACMode.HEAT): vol.In(
+            [HVACMode.HEAT, HVACMode.COOL]
         ),
     }
 )
+
+_SOURCE_DOMAIN_SCHEMA = vol.Schema(
+    {vol.Required(CONF_SOURCE): cv.entity_domain(["climate", *SWITCH_DOMAINS])},
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+def _validate_platform(config: ConfigType) -> ConfigType:
+    """Validate with the schema that matches the source entity's domain."""
+    config = _SOURCE_DOMAIN_SCHEMA(config)
+    if split_entity_id(config[CONF_SOURCE])[0] == "climate":
+        return CLIMATE_SOURCE_SCHEMA(config)
+    return SWITCH_SOURCE_SCHEMA(config)
+
+
+PLATFORM_SCHEMA = vol.All(_validate_platform)
 
 
 async def async_setup_platform(
@@ -144,47 +193,39 @@ async def async_setup_platform(
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
     """Set up a proxy climate entity from YAML."""
-    async_add_entities([ProxyClimate(hass, config)])
+    if split_entity_id(config[CONF_SOURCE])[0] == "climate":
+        async_add_entities([ProxyClimate(hass, config)])
+    else:
+        async_add_entities([SwitchProxyClimate(hass, config)])
 
 
-class ProxyClimate(ClimateEntity, RestoreEntity):
-    """Climate entity that drives another climate entity."""
+class BaseProxyClimate(ClimateEntity, RestoreEntity):
+    """Thermostat logic shared by every source type.
+
+    Tracks the room temperature and decides when a heating/cooling cycle starts
+    and stops; subclasses decide what that means for the source.
+    """
 
     _attr_should_poll = False
-    _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.TURN_ON
-        | ClimateEntityFeature.TURN_OFF
-    )
 
-    def __init__(self, hass: HomeAssistant, config: ConfigType) -> None:
+    def __init__(
+        self, hass: HomeAssistant, config: ConfigType, modes: list[HVACMode]
+    ) -> None:
         self._attr_name = config[CONF_NAME]
         self._attr_unique_id = config.get(CONF_UNIQUE_ID)
         self._attr_temperature_unit = hass.config.units.temperature_unit
 
         self._source: str = config[CONF_SOURCE]
+        self._source_domain = split_entity_id(self._source)[0]
         self._sensor: str = config[CONF_SENSOR]
-        self._source_fan_modes: list[str] = config[CONF_SOURCE_FAN_MODES]
-        self._modes = [HVACMode(m) for m in config[CONF_HVAC_MODES]]
-        self._heat_sp: float | None = config.get(CONF_HEAT_SETPOINT)
-        self._cool_sp: float | None = config.get(CONF_COOL_SETPOINT)
+        self._modes = modes
         self._start_offset: float = config[CONF_START_OFFSET]
         self._stop_offset: float = config[CONF_STOP_OFFSET]
-        self._fan_step: float = config[CONF_FAN_STEP]
-        self._fan_hyst: float = config[CONF_FAN_HYSTERESIS]
-        self._fan_offsets: dict[str, int] = dict(config[CONF_FAN_MODE_OFFSETS])
-        self._idle_action: str = config[CONF_IDLE_ACTION]
         self._min_cycle: timedelta = config[CONF_MIN_CYCLE]
         self._interval: timedelta = config[CONF_INTERVAL]
 
         self._attr_hvac_modes = [HVACMode.OFF, *self._modes]
         self._attr_hvac_mode = HVACMode.OFF
-        self._attr_fan_modes = list(self._fan_offsets)
-        self._attr_fan_mode = next(
-            (m for m, off in self._fan_offsets.items() if off == 0),
-            self._attr_fan_modes[0],
-        )
         self._attr_target_temperature = config[CONF_TARGET_TEMP]
         self._attr_min_temp = config[CONF_MIN_TEMP]
         self._attr_max_temp = config[CONF_MAX_TEMP]
@@ -194,9 +235,7 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
         self._last_on_mode: HVACMode = self._modes[0]
         self._active = False  # True while heating/cooling (inside the deadband cycle)
         self._last_switch: datetime | None = None
-        self._base_level: int | None = None  # source fan level before offset
         self._demand: float | None = None
-        self._source_fan: str | None = None
         self._started = False
         self._lock = asyncio.Lock()
 
@@ -207,19 +246,7 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
         await super().async_added_to_hass()
 
         if (old := await self.async_get_last_state()) is not None:
-            if old.state in self._attr_hvac_modes:
-                self._attr_hvac_mode = HVACMode(old.state)
-            if (temp := old.attributes.get(ATTR_TEMPERATURE)) is not None:
-                self._attr_target_temperature = float(temp)
-            if (fan := old.attributes.get(ATTR_FAN_MODE)) in self._fan_offsets:
-                self._attr_fan_mode = fan
-            if (last := old.attributes.get(ATTR_LAST_ON_MODE)) in self._modes:
-                self._last_on_mode = HVACMode(last)
-            # Resume an in-progress cycle instead of waiting for the start threshold.
-            self._active = old.attributes.get(ATTR_HVAC_ACTION) in (
-                HVACAction.HEATING,
-                HVACAction.COOLING,
-            )
+            self._restore(old)
         if self._attr_hvac_mode != HVACMode.OFF:
             self._last_on_mode = self._attr_hvac_mode
 
@@ -240,28 +267,25 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
         )
         self.async_on_remove(async_at_started(self.hass, self._async_startup))
 
+    def _restore(self, old: State) -> None:
+        if old.state in self._attr_hvac_modes:
+            self._attr_hvac_mode = HVACMode(old.state)
+        if (temp := old.attributes.get(ATTR_TEMPERATURE)) is not None:
+            self._attr_target_temperature = float(temp)
+        if (last := old.attributes.get(ATTR_LAST_ON_MODE)) in self._modes:
+            self._last_on_mode = HVACMode(last)
+        # Resume an in-progress cycle instead of waiting for the start threshold.
+        self._active = old.attributes.get(ATTR_HVAC_ACTION) in (
+            HVACAction.HEATING,
+            HVACAction.COOLING,
+        )
+
     async def _async_startup(self, _hass: HomeAssistant) -> None:
         self._attr_current_temperature = self._read_temperature(
             self.hass.states.get(self._sensor)
         )
-        self._check_source_fan_modes()
         self._started = True
         await self._async_control()
-
-    def _check_source_fan_modes(self) -> None:
-        state = self.hass.states.get(self._source)
-        available = state.attributes.get(ATTR_FAN_MODES) if state else None
-        if not available:
-            return
-        missing = [m for m in self._source_fan_modes if m not in available]
-        if missing:
-            _LOGGER.warning(
-                "%s: source_fan_modes %s not offered by %s (it offers %s)",
-                self.entity_id,
-                missing,
-                self._source,
-                available,
-            )
 
     # -------------------------------------------------------------- listeners
 
@@ -314,11 +338,10 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
         if mode == HVACMode.OFF:
             self._set_active(False)
             self._demand = None
-            self._source_fan = None
             # Only switch the source off when the user turns the proxy off;
             # afterwards the source is left alone (remote etc. still works).
             if force:
-                await self._async_apply_source(HVACMode.OFF)
+                await self._async_source_off()
             return
 
         cur = self._attr_current_temperature
@@ -330,7 +353,7 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
                 )
             self._set_active(False)
             self._demand = None
-            await self._async_apply_idle(mode)
+            await self._async_source_idle(mode)
             return
 
         # Demand > 0 means the room needs conditioning in the current mode.
@@ -345,21 +368,15 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
                 self._set_active(False)
 
         if self._active:
-            level = self._fan_level(demand)
-            self._source_fan = self._source_fan_modes[level]
-            await self._async_apply_source(
-                mode, self._running_setpoint(mode), self._source_fan
-            )
+            await self._async_source_active(mode, demand)
         else:
-            await self._async_apply_idle(mode)
+            await self._async_source_idle(mode)
 
     def _set_active(self, active: bool) -> None:
         if active == self._active:
             return
         self._active = active
         self._last_switch = dt_util.utcnow()
-        if not active:
-            self._base_level = None
         _LOGGER.debug(
             "%s: %s (room %s, target %s)",
             self.entity_id,
@@ -372,6 +389,141 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
         if not self._min_cycle or self._last_switch is None:
             return True
         return dt_util.utcnow() - self._last_switch >= self._min_cycle
+
+    # --------------------------------------------------------- source control
+
+    async def _async_source_off(self) -> None:
+        """Switch the source off because the user turned the proxy off."""
+        raise NotImplementedError
+
+    async def _async_source_idle(self, mode: HVACMode) -> None:
+        """Keep the source idle while the proxy waits in `mode`."""
+        raise NotImplementedError
+
+    async def _async_source_active(self, mode: HVACMode, demand: float) -> None:
+        """Run the source in `mode` for the given demand."""
+        raise NotImplementedError
+
+    async def _async_call(self, service: str, data: dict[str, Any]) -> None:
+        domain = self._source_domain
+        _LOGGER.debug("%s -> %s.%s %s", self.entity_id, domain, service, data)
+        try:
+            await self.hass.services.async_call(domain, service, data, blocking=True)
+        except Exception as err:  # noqa: BLE001 - keep the control loop alive
+            _LOGGER.warning(
+                "%s: %s.%s on %s failed: %s",
+                self.entity_id,
+                domain,
+                service,
+                self._source,
+                err,
+            )
+
+    # ------------------------------------------------------------ entity API
+
+    @property
+    def hvac_action(self) -> HVACAction:
+        if self._attr_hvac_mode == HVACMode.OFF:
+            return HVACAction.OFF
+        if not self._active:
+            return HVACAction.IDLE
+        if self._attr_hvac_mode == HVACMode.HEAT:
+            return HVACAction.HEATING
+        return HVACAction.COOLING
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "demand": self._demand,
+            ATTR_LAST_ON_MODE: self._last_on_mode,
+        }
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        if hvac_mode != self._attr_hvac_mode:
+            # A running cycle belongs to the previous mode.
+            self._set_active(False)
+        self._attr_hvac_mode = hvac_mode
+        if hvac_mode != HVACMode.OFF:
+            self._last_on_mode = hvac_mode
+        await self._async_control(force=True)
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        if (temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
+            self._attr_target_temperature = float(temp)
+        if (mode := kwargs.get(ATTR_HVAC_MODE)) is not None:
+            await self.async_set_hvac_mode(HVACMode(mode))
+        else:
+            await self._async_control()
+
+    async def async_turn_on(self) -> None:
+        await self.async_set_hvac_mode(self._last_on_mode)
+
+    async def async_turn_off(self) -> None:
+        await self.async_set_hvac_mode(HVACMode.OFF)
+
+
+class ProxyClimate(BaseProxyClimate):
+    """Climate entity that drives another climate entity through its fan speed."""
+
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.FAN_MODE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
+
+    def __init__(self, hass: HomeAssistant, config: ConfigType) -> None:
+        super().__init__(hass, config, [HVACMode(m) for m in config[CONF_HVAC_MODES]])
+
+        self._source_fan_modes: list[str] = config[CONF_SOURCE_FAN_MODES]
+        self._heat_sp: float | None = config.get(CONF_HEAT_SETPOINT)
+        self._cool_sp: float | None = config.get(CONF_COOL_SETPOINT)
+        self._fan_step: float = config[CONF_FAN_STEP]
+        self._fan_hyst: float = config[CONF_FAN_HYSTERESIS]
+        self._fan_offsets: dict[str, int] = dict(config[CONF_FAN_MODE_OFFSETS])
+        self._idle_action: str = config[CONF_IDLE_ACTION]
+
+        self._attr_fan_modes = list(self._fan_offsets)
+        self._attr_fan_mode = next(
+            (m for m, off in self._fan_offsets.items() if off == 0),
+            self._attr_fan_modes[0],
+        )
+
+        self._base_level: int | None = None  # source fan level before offset
+        self._source_fan: str | None = None
+
+    # ------------------------------------------------------------------ setup
+
+    def _restore(self, old: State) -> None:
+        super()._restore(old)
+        if (fan := old.attributes.get(ATTR_FAN_MODE)) in self._fan_offsets:
+            self._attr_fan_mode = fan
+
+    async def _async_startup(self, _hass: HomeAssistant) -> None:
+        self._check_source_fan_modes()
+        await super()._async_startup(_hass)
+
+    def _check_source_fan_modes(self) -> None:
+        state = self.hass.states.get(self._source)
+        available = state.attributes.get(ATTR_FAN_MODES) if state else None
+        if not available:
+            return
+        missing = [m for m in self._source_fan_modes if m not in available]
+        if missing:
+            _LOGGER.warning(
+                "%s: source_fan_modes %s not offered by %s (it offers %s)",
+                self.entity_id,
+                missing,
+                self._source,
+                available,
+            )
+
+    # ---------------------------------------------------------- control logic
+
+    def _set_active(self, active: bool) -> None:
+        super()._set_active(active)
+        if not active:
+            self._base_level = None
 
     def _fan_level(self, demand: float) -> int:
         """Map demand to an index into source_fan_modes.
@@ -397,19 +549,18 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
 
     # --------------------------------------------------------- source control
 
-    def _source_float(self, attr: str, fallback: float) -> float:
-        state = self.hass.states.get(self._source)
-        try:
-            return float(state.attributes.get(attr))  # type: ignore[union-attr, arg-type]
-        except (AttributeError, TypeError, ValueError):
-            return fallback
+    async def _async_source_off(self) -> None:
+        self._source_fan = None
+        await self._async_apply_source(HVACMode.OFF)
 
-    def _running_setpoint(self, mode: HVACMode) -> float:
-        if mode == HVACMode.HEAT:
-            return self._heat_sp if self._heat_sp is not None else self._source_float("max_temp", 30.0)
-        return self._cool_sp if self._cool_sp is not None else self._source_float("min_temp", 16.0)
+    async def _async_source_active(self, mode: HVACMode, demand: float) -> None:
+        level = self._fan_level(demand)
+        self._source_fan = self._source_fan_modes[level]
+        await self._async_apply_source(
+            mode, self._running_setpoint(mode), self._source_fan
+        )
 
-    async def _async_apply_idle(self, mode: HVACMode) -> None:
+    async def _async_source_idle(self, mode: HVACMode) -> None:
         quietest = self._source_fan_modes[0]
         if self._idle_action == IDLE_TURN_OFF:
             self._source_fan = None
@@ -427,6 +578,18 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
                 else self._source_float("max_temp", 30.0)
             )
             await self._async_apply_source(mode, setpoint, quietest)
+
+    def _source_float(self, attr: str, fallback: float) -> float:
+        state = self.hass.states.get(self._source)
+        try:
+            return float(state.attributes.get(attr))  # type: ignore[union-attr, arg-type]
+        except (AttributeError, TypeError, ValueError):
+            return fallback
+
+    def _running_setpoint(self, mode: HVACMode) -> float:
+        if mode == HVACMode.HEAT:
+            return self._heat_sp if self._heat_sp is not None else self._source_float("max_temp", 30.0)
+        return self._cool_sp if self._cool_sp is not None else self._source_float("min_temp", 16.0)
 
     async def _async_apply_source(
         self,
@@ -457,64 +620,47 @@ class ProxyClimate(ClimateEntity, RestoreEntity):
         if fan_mode is not None and state.attributes.get(ATTR_FAN_MODE) != fan_mode:
             await self._async_call("set_fan_mode", {**base, ATTR_FAN_MODE: fan_mode})
 
-    async def _async_call(self, service: str, data: dict[str, Any]) -> None:
-        _LOGGER.debug("%s -> climate.%s %s", self.entity_id, service, data)
-        try:
-            await self.hass.services.async_call(
-                "climate", service, data, blocking=True
-            )
-        except Exception as err:  # noqa: BLE001 - keep the control loop alive
-            _LOGGER.warning(
-                "%s: climate.%s on %s failed: %s",
-                self.entity_id,
-                service,
-                self._source,
-                err,
-            )
-
     # ------------------------------------------------------------ entity API
 
     @property
-    def hvac_action(self) -> HVACAction:
-        if self._attr_hvac_mode == HVACMode.OFF:
-            return HVACAction.OFF
-        if not self._active:
-            return HVACAction.IDLE
-        if self._attr_hvac_mode == HVACMode.HEAT:
-            return HVACAction.HEATING
-        return HVACAction.COOLING
-
-    @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "demand": self._demand,
-            "source_fan_mode": self._source_fan,
-            ATTR_LAST_ON_MODE: self._last_on_mode,
-        }
-
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        if hvac_mode != self._attr_hvac_mode:
-            # A running cycle belongs to the previous mode.
-            self._set_active(False)
-        self._attr_hvac_mode = hvac_mode
-        if hvac_mode != HVACMode.OFF:
-            self._last_on_mode = hvac_mode
-        await self._async_control(force=True)
-
-    async def async_set_temperature(self, **kwargs: Any) -> None:
-        if (temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
-            self._attr_target_temperature = float(temp)
-        if (mode := kwargs.get(ATTR_HVAC_MODE)) is not None:
-            await self.async_set_hvac_mode(HVACMode(mode))
-        else:
-            await self._async_control()
+        return {**super().extra_state_attributes, "source_fan_mode": self._source_fan}
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         self._attr_fan_mode = fan_mode
         await self._async_control()
 
-    async def async_turn_on(self) -> None:
-        await self.async_set_hvac_mode(self._last_on_mode)
 
-    async def async_turn_off(self) -> None:
-        await self.async_set_hvac_mode(HVACMode.OFF)
+class SwitchProxyClimate(BaseProxyClimate):
+    """Climate entity that switches a plain on/off heater or cooler."""
+
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TURN_ON
+        | ClimateEntityFeature.TURN_OFF
+    )
+
+    def __init__(self, hass: HomeAssistant, config: ConfigType) -> None:
+        super().__init__(hass, config, [HVACMode(config[CONF_HVAC_MODE])])
+
+    async def _async_source_off(self) -> None:
+        await self._async_switch(False)
+
+    async def _async_source_active(self, mode: HVACMode, demand: float) -> None:
+        await self._async_switch(True)
+
+    async def _async_source_idle(self, mode: HVACMode) -> None:
+        await self._async_switch(False)
+
+    async def _async_switch(self, on: bool) -> None:
+        """Switch the source unless it is already in that state."""
+        state = self.hass.states.get(self._source)
+        if state is None or state.state == STATE_UNAVAILABLE:
+            return
+        # An unknown state still gets the command, so a heater whose plug
+        # hasn't reported yet isn't left running.
+        if state.state != (STATE_ON if on else STATE_OFF):
+            await self._async_call(
+                SERVICE_TURN_ON if on else SERVICE_TURN_OFF,
+                {ATTR_ENTITY_ID: self._source},
+            )

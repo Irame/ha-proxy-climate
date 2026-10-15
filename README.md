@@ -1,6 +1,9 @@
 # Proxy Climate for Home Assistant
 
-A climate entity that sits in front of your existing AC / heat pump entity. It reads the room temperature from another entity, runs the unit at a fixed extreme setpoint while it is working, controls how hard it works through the unit's fan speed, and uses a deadband so the unit doesn't flip on and off all the time.
+A climate entity that sits in front of a device you already have in Home Assistant and turns it into a proper thermostat. It reads the room temperature from another entity and uses a deadband so the device doesn't flip on and off all the time. Two kinds of device are supported:
+
+* **AC / heat pump** (a `climate` entity): runs the unit at a fixed extreme setpoint while it is working and controls how hard it works through the unit's fan speed.
+* **Space heater or cooler on a switch** (a `switch` or `input_boolean` entity, e.g. a smart plug): switches it on while working and off while idle.
 
 ## Install with HACS
 
@@ -11,6 +14,10 @@ Or manually: HACS → ⋮ (top right) → Custom repositories → paste `https:/
 You'll get a new `climate.<name>` entity that works in the normal thermostat card. Updates show up in HACS (and under Settings → Updates) whenever a new GitHub release is published.
 
 ## Configuration
+
+Both kinds use `platform: proxy_climate`. The domain of `source` decides which one you get.
+
+### AC / heat pump
 
 ```yaml
 climate:
@@ -44,13 +51,39 @@ climate:
 
 Check the exact fan mode names under Developer Tools → States → your AC entity → `fan_modes`. A warning is logged at startup if any configured name doesn't exist on the unit.
 
+### Space heater / cooler on a switch
+
+```yaml
+climate:
+  - platform: proxy_climate
+    name: Office Heater
+    unique_id: proxy_climate_office_heater
+    source: switch.office_heater_plug       # switch or input_boolean
+    sensor: sensor.office_temperature       # sensor or climate entity (uses current_temperature)
+
+    # everything below is optional (defaults shown)
+    hvac_mode: heat            # heat | cool, i.e. what the device does while switched on
+    start_offset: 0.5
+    stop_offset: 0.5
+    min_cycle_duration: "00:00:00"
+    control_interval: "00:01:00"
+    target_temp: 21
+    min_temp: 16
+    max_temp: 30
+    target_temp_step: 0.5
+```
+
+The fan-speed options of the AC variant (`source_fan_modes`, `fan_step`, `fan_mode_offsets`, setpoints, `idle_action`, …) don't apply here and are rejected. The entity offers `off` plus the configured `hvac_mode`, and has no fan mode.
+
 ## How it behaves
 
 "Demand" is how far the room is from the target in the direction that needs work: `target − room` when heating, `room − target` when cooling. It's shown as the `demand` attribute on the proxy entity.
 
-The unit starts when demand reaches `start_offset` and stops when demand falls to `−stop_offset`, i.e. once the room has overshot the target. Between those points it keeps doing whatever it was doing, which is the deadband. `min_cycle_duration` additionally enforces a minimum on-time and off-time; user actions like changing the HVAC mode bypass it.
+The device starts when demand reaches `start_offset` and stops when demand falls to `−stop_offset`, i.e. once the room has overshot the target. Between those points it keeps doing whatever it was doing, which is the deadband. `min_cycle_duration` additionally enforces a minimum on-time and off-time; user actions like changing the HVAC mode bypass it.
 
-While running, the AC gets `heat_setpoint` / `cool_setpoint` and a fan level of `floor(demand / fan_step)`, clamped to the available levels, then shifted by the proxy fan mode's offset. With the defaults, a 21° heating target and the medium proxy fan mode:
+A switch source is simply on while running and off while idle. With the defaults and a 21° heating target, it switches on at 20.5° and off again at 21.5°.
+
+While running, an AC gets `heat_setpoint` / `cool_setpoint` and a fan level of `floor(demand / fan_step)`, clamped to the available levels, then shifted by the proxy fan mode's offset. With the defaults, a 21° heating target and the medium proxy fan mode:
 
 | Room temp | Demand | AC state |
 |---|---|---|
@@ -69,15 +102,15 @@ When idle, `idle_action` decides what the AC does: `turn_off` switches it off, `
 
 ## Notes
 
-While the proxy is in heat or cool, it owns the AC: anything changed with the IR remote gets corrected on the next `control_interval` tick. When you turn the proxy off it switches the AC off once and then leaves it alone.
+While the proxy is in heat or cool, it owns the device: anything changed with the IR remote, or by flipping the switch by hand, gets corrected on the next `control_interval` tick. When you turn the proxy off it switches the device off once and then leaves it alone.
 
-If the room sensor becomes unavailable, the proxy goes idle until readings come back, so the AC is never left running at an extreme setpoint without feedback.
+If the room sensor becomes unavailable, the proxy goes idle until readings come back, so the device is never left running without feedback.
 
 Target temperature, mode, fan mode, and whether a cycle was in progress are restored after a restart.
 
 On many inverter units the compressor follows the gap between its setpoint and its own internal sensor, so fan speed only partly limits output. If you see icing in cooling, high-pressure trips in heating, or noisy operation, use less extreme `heat_setpoint` / `cool_setpoint` values (e.g. 26 / 20).
 
-For troubleshooting, enable debug logging; every start/stop decision and every command sent to the AC is logged:
+For troubleshooting, enable debug logging; every start/stop decision and every command sent to the device is logged:
 
 ```yaml
 logger:

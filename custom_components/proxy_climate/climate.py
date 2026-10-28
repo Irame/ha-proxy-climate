@@ -11,6 +11,11 @@ time so the source doesn't switch on and off too often. The domain of the
   own low/medium/high fan setting,
 * switch / input_boolean (e.g. a space heater or cooler on a smart plug):
   switches the source on while active and off while idle.
+
+With `optimizer_url` set, the entity also offers an `auto` mode: on every
+control tick it posts its state to an external optimizer and does what the
+answer says (run in heat or cool at a given fan level, or stay idle). Without
+a fresh answer it falls back to its own thermostat.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import logging
 import math
 from typing import Any
 
+import aiohttp
 import voluptuous as vol
 
 from homeassistant.components.climate import (
@@ -50,6 +56,7 @@ from homeassistant.core import (
     split_entity_id,
 )
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
@@ -82,6 +89,18 @@ CONF_TARGET_TEMP = "target_temp"
 CONF_MIN_TEMP = "min_temp"
 CONF_MAX_TEMP = "max_temp"
 CONF_TEMP_STEP = "target_temp_step"
+CONF_OPTIMIZER_URL = "optimizer_url"
+CONF_OPTIMIZER_TOKEN = "optimizer_token"
+CONF_OPTIMIZER_TIMEOUT = "optimizer_timeout"
+CONF_AUTO_FALLBACK = "auto_fallback"
+
+COMMAND_PATH = "/api/v1/command"
+
+# What the auto mode is doing right now (the `optimizer` attribute).
+OPT_FOLLOWING = "following"
+OPT_DEFERRED = "deferred"  # the optimizer answered but asked us to decide ourselves
+OPT_UNREACHABLE = "unreachable"
+OPT_STALE = "stale"
 
 # Source domains that are plain on/off devices.
 SWITCH_DOMAINS = ["switch", "input_boolean"]
@@ -96,6 +115,7 @@ ATTR_FAN_MODES = "fan_modes"
 ATTR_HVAC_ACTION = "hvac_action"
 ATTR_CURRENT_TEMPERATURE = "current_temperature"
 ATTR_LAST_ON_MODE = "last_on_mode"
+ATTR_RUN_MODE = "run_mode"
 
 DEFAULT_FAN_OFFSETS = {"low": -1, "medium": 0, "high": 1}
 
@@ -121,6 +141,17 @@ _COMMON_SCHEMA = CLIMATE_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_MAX_TEMP, default=30.0): _FLOAT,
         vol.Optional(CONF_TEMP_STEP, default=0.5): vol.All(
             vol.Coerce(float), vol.Range(min=0.1)
+        ),
+        # External optimizer that the `auto` mode asks on every control tick.
+        vol.Optional(CONF_OPTIMIZER_URL): cv.url,
+        vol.Optional(CONF_OPTIMIZER_TOKEN): cv.string,
+        vol.Optional(CONF_OPTIMIZER_TIMEOUT, default=timedelta(seconds=5)): vol.All(
+            cv.time_period, vol.Range(min=timedelta(seconds=1))
+        ),
+        # What the built-in thermostat does in auto mode while the optimizer
+        # has no fresh answer. Default: the first of the entity's modes.
+        vol.Optional(CONF_AUTO_FALLBACK): vol.In(
+            [HVACMode.HEAT, HVACMode.COOL, HVACMode.OFF]
         ),
     }
 )
@@ -180,8 +211,19 @@ def _validate_platform(config: ConfigType) -> ConfigType:
     """Validate with the schema that matches the source entity's domain."""
     config = _SOURCE_DOMAIN_SCHEMA(config)
     if split_entity_id(config[CONF_SOURCE])[0] == "climate":
-        return CLIMATE_SOURCE_SCHEMA(config)
-    return SWITCH_SOURCE_SCHEMA(config)
+        config = CLIMATE_SOURCE_SCHEMA(config)
+        modes = config[CONF_HVAC_MODES]
+    else:
+        config = SWITCH_SOURCE_SCHEMA(config)
+        modes = [config[CONF_HVAC_MODE]]
+    fallback = config.get(CONF_AUTO_FALLBACK)
+    if fallback not in (None, HVACMode.OFF) and fallback not in modes:
+        raise vol.Invalid(
+            f"{CONF_AUTO_FALLBACK} {fallback} is not one of the entity's modes {modes}"
+        )
+    if fallback is not None and CONF_OPTIMIZER_URL not in config:
+        raise vol.Invalid(f"{CONF_AUTO_FALLBACK} needs {CONF_OPTIMIZER_URL}")
+    return config
 
 
 PLATFORM_SCHEMA = vol.All(_validate_platform)
@@ -225,7 +267,14 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         self._min_cycle: timedelta = config[CONF_MIN_CYCLE]
         self._interval: timedelta = config[CONF_INTERVAL]
 
+        self._optimizer_url: str | None = config.get(CONF_OPTIMIZER_URL)
+        self._optimizer_token: str | None = config.get(CONF_OPTIMIZER_TOKEN)
+        self._optimizer_timeout: timedelta = config[CONF_OPTIMIZER_TIMEOUT]
+        self._auto_fallback = HVACMode(config.get(CONF_AUTO_FALLBACK) or self._modes[0])
+
         self._attr_hvac_modes = [HVACMode.OFF, *self._modes]
+        if self._optimizer_url:
+            self._attr_hvac_modes.append(HVACMode.AUTO)
         self._attr_hvac_mode = HVACMode.OFF
         self._attr_target_temperature = config[CONF_TARGET_TEMP]
         self._attr_min_temp = config[CONF_MIN_TEMP]
@@ -240,6 +289,14 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         self._pending_off = False  # turn-off that hasn't reached the source yet
         self._started = False
         self._lock = asyncio.Lock()
+
+        # Auto mode: the mode the source is actually run in, and the last
+        # answer from the optimizer.
+        self._run_mode: HVACMode | None = None
+        self._command: dict[str, Any] | None = None
+        self._command_until: datetime | None = None
+        self._optimizer_state: str | None = None
+        self._optimizer_reason: str | None = None
 
     # ------------------------------------------------------------------ setup
 
@@ -277,16 +334,19 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         if (last := old.attributes.get(ATTR_LAST_ON_MODE)) in self._modes:
             self._last_on_mode = HVACMode(last)
         # Resume an in-progress cycle instead of waiting for the start threshold.
-        self._active = old.attributes.get(ATTR_HVAC_ACTION) in (
-            HVACAction.HEATING,
-            HVACAction.COOLING,
-        )
+        action = old.attributes.get(ATTR_HVAC_ACTION)
+        self._active = action in (HVACAction.HEATING, HVACAction.COOLING)
+        if self._active:
+            run = HVACMode.HEAT if action == HVACAction.HEATING else HVACMode.COOL
+            self._run_mode = run if run in self._modes else None
 
     async def _async_startup(self, _hass: HomeAssistant) -> None:
         self._attr_current_temperature = self._read_temperature(
             self.hass.states.get(self._sensor)
         )
         self._started = True
+        if self._attr_hvac_mode == HVACMode.AUTO:
+            await self._async_fetch_command()
         await self._async_control()
 
     # -------------------------------------------------------------- listeners
@@ -308,6 +368,10 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
             await self._async_control()
 
     async def _async_tick(self, _now: datetime) -> None:
+        # The optimizer is asked on the tick only; sensor updates in between
+        # reuse its last answer.
+        if self._attr_hvac_mode == HVACMode.AUTO:
+            await self._async_fetch_command()
         await self._async_control()
 
     @staticmethod
@@ -347,6 +411,21 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
                 self._pending_off = not await self._async_source_off()
             return
 
+        if mode == HVACMode.AUTO:
+            if (command := self._valid_command()) is not None:
+                await self._async_follow(command, force)
+                return
+            # No fresh answer: the built-in thermostat takes over.
+            mode = self._auto_fallback
+            if mode == HVACMode.OFF:
+                await self._async_stop_or_hold(force)
+                return
+            if self._run_mode not in (None, mode) and self._active:
+                self._set_active(False)
+            self._run_mode = mode
+        else:
+            self._run_mode = mode
+
         cur = self._attr_current_temperature
         target = self._attr_target_temperature
         if cur is None or target is None:
@@ -374,6 +453,121 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
             await self._async_source_active(mode, demand)
         else:
             await self._async_source_idle(mode)
+
+    # -------------------------------------------------------------- auto mode
+
+    def _valid_command(self) -> dict[str, Any] | None:
+        if self._command is None or self._command_until is None:
+            return None
+        if dt_util.utcnow() > self._command_until:
+            if self._optimizer_state == OPT_FOLLOWING:
+                _LOGGER.warning(
+                    "%s: optimizer answer expired, using the built-in thermostat",
+                    self.entity_id,
+                )
+            self._optimizer_state = OPT_STALE
+            self._command = None
+            return None
+        return self._command
+
+    async def _async_follow(self, command: dict[str, Any], force: bool) -> None:
+        """Do what the optimizer asked for, within min_cycle_duration."""
+        want = command["hvac_mode"]
+        if want == HVACMode.OFF:
+            await self._async_stop_or_hold(force)
+            return
+        run = HVACMode(want)
+        if self._active and self._run_mode != run:
+            # heat <-> cool: the running cycle belongs to the other mode
+            self._set_active(False)
+        self._run_mode = run
+        if not self._active and (force or self._cycle_allowed()):
+            self._set_active(True)
+        if self._active:
+            await self._async_source_command(run, command)
+        else:
+            await self._async_source_idle(run)
+
+    async def _async_stop_or_hold(self, force: bool) -> None:
+        """Stop the source, unless min_cycle_duration says it has to keep running."""
+        run = self._run_mode or self._modes[0]
+        if self._active and not (force or self._cycle_allowed()):
+            await self._async_source_command(run, self._command or {})
+            return
+        self._set_active(False)
+        self._demand = None
+        await self._async_source_idle(run)
+
+    def _command_request(self) -> dict[str, Any]:
+        """What the optimizer gets to know about this entity on every tick."""
+        return {
+            "entity_id": self.entity_id,
+            "name": self._attr_name,
+            "source": self._source,
+            "source_domain": self._source_domain,
+            "sensor": self._sensor,
+            "modes": [str(m) for m in self._modes],
+            "current_temperature": self._attr_current_temperature,
+            "target_temperature": self._attr_target_temperature,
+            "running": self._is_running(),
+            "run_mode": str(self._run_mode) if self._run_mode else None,
+            "last_switch": self._last_switch.isoformat() if self._last_switch else None,
+            "min_cycle_s": self._min_cycle.total_seconds(),
+            "control_interval_s": self._interval.total_seconds(),
+        }
+
+    async def _async_fetch_command(self) -> None:
+        """Ask the optimizer what to do until its next answer."""
+        assert self._optimizer_url
+        url = self._optimizer_url.rstrip("/") + COMMAND_PATH
+        headers = {}
+        if self._optimizer_token:
+            headers["Authorization"] = f"Bearer {self._optimizer_token}"
+        session = async_get_clientsession(self.hass)
+        try:
+            async with asyncio.timeout(self._optimizer_timeout.total_seconds()):
+                resp = await session.post(url, json=self._command_request(), headers=headers)
+                resp.raise_for_status()
+                data = await resp.json()
+            command = self._parse_command(data)
+        except (aiohttp.ClientError, TimeoutError, ValueError, TypeError) as err:
+            # The last answer still holds until it expires, so a single lost
+            # request doesn't hand control back to the thermostat.
+            if self._optimizer_state != OPT_UNREACHABLE:
+                _LOGGER.warning(
+                    "%s: no usable answer from the optimizer at %s (%r), "
+                    "keeping its last answer until it expires",
+                    self.entity_id,
+                    url,
+                    err,
+                )
+            self._optimizer_state = OPT_UNREACHABLE
+            return
+        self._optimizer_reason = data.get("reason")
+        if command is None:
+            self._optimizer_state = OPT_DEFERRED
+            self._command = None
+            return
+        self._optimizer_state = OPT_FOLLOWING
+        self._command, self._command_until = command
+
+    def _parse_command(self, data: Any) -> tuple[dict[str, Any], datetime] | None:
+        """Check the answer; None means the optimizer leaves the decision to us."""
+        if not isinstance(data, dict):
+            raise ValueError("answer is not a JSON object")
+        if data.get("follow", True) is False:
+            return None
+        mode = data.get("hvac_mode")
+        if mode != HVACMode.OFF and mode not in self._modes:
+            raise ValueError(f"hvac_mode {mode!r} is not one of {self._modes}")
+        until = None
+        if (raw := data.get("valid_until")) is not None:
+            until = dt_util.parse_datetime(str(raw))
+            if until is None:
+                raise ValueError(f"valid_until {raw!r} is not a timestamp")
+        if until is None:
+            until = dt_util.utcnow() + 2 * self._interval
+        return dict(data, hvac_mode=HVACMode(mode)), until
 
     def _set_active(self, active: bool) -> None:
         if active == self._active:
@@ -410,6 +604,10 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         """Run the source in `mode` for the given demand."""
         raise NotImplementedError
 
+    async def _async_source_command(self, mode: HVACMode, command: dict[str, Any]) -> None:
+        """Run the source in `mode` as the optimizer asked."""
+        raise NotImplementedError
+
     def _is_running(self) -> bool:
         """Whether the source is heating/cooling right now."""
         return self._active
@@ -439,16 +637,21 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
             return HVACAction.OFF
         if not self._is_running():
             return HVACAction.IDLE
-        if self._attr_hvac_mode == HVACMode.HEAT:
+        if self._run_mode == HVACMode.HEAT:
             return HVACAction.HEATING
         return HVACAction.COOLING
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {
+        attrs: dict[str, Any] = {
             "demand": self._demand,
             ATTR_LAST_ON_MODE: self._last_on_mode,
         }
+        if self._attr_hvac_mode == HVACMode.AUTO:
+            attrs["optimizer"] = self._optimizer_state
+            attrs["optimizer_reason"] = self._optimizer_reason
+            attrs[ATTR_RUN_MODE] = self._run_mode
+        return attrs
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         self._check_hvac_mode(hvac_mode)
@@ -456,9 +659,12 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         if changed:
             # A running cycle belongs to the previous mode.
             self._set_active(False)
+            self._run_mode = None
         self._attr_hvac_mode = hvac_mode
-        if hvac_mode != HVACMode.OFF:
+        if hvac_mode in self._modes:
             self._last_on_mode = hvac_mode
+        if hvac_mode == HVACMode.AUTO and changed and self._started:
+            await self._async_fetch_command()
         # Re-sending the current mode must not skip min_cycle_duration, but
         # "off" always goes through so it also stops a source switched on by hand.
         await self._async_control(force=changed or hvac_mode == HVACMode.OFF)
@@ -587,6 +793,28 @@ class ProxyClimate(BaseProxyClimate):
             mode, self._running_setpoint(mode), self._source_fan
         )
 
+    async def _async_source_command(self, mode: HVACMode, command: dict[str, Any]) -> None:
+        top = len(self._source_fan_modes) - 1
+        level = command.get("fan_level")
+        if isinstance(level, bool) or not isinstance(level, int):
+            # no usable level: keep the one running, else start at the quietest
+            level = self._base_level if self._base_level is not None else 0
+        level = max(0, min(level, top))
+        self._base_level = level
+        self._source_fan = self._source_fan_modes[level]
+        await self._async_apply_source(mode, self._running_setpoint(mode), self._source_fan)
+
+    def _command_request(self) -> dict[str, Any]:
+        return {
+            **super()._command_request(),
+            "source_fan_modes": self._source_fan_modes,
+            "source_fan_mode": self._source_fan,
+            "fan_mode": self._attr_fan_mode,
+            "fan_mode_offset": self._fan_offsets.get(self._attr_fan_mode or "", 0),
+            "fan_modes": self._attr_fan_modes,
+            "idle_action": self._idle_action,
+        }
+
     async def _async_source_idle(self, mode: HVACMode) -> None:
         quietest = self._source_fan_modes[0]
         if self._idle_action == IDLE_TURN_OFF:
@@ -687,6 +915,9 @@ class SwitchProxyClimate(BaseProxyClimate):
         return await self._async_switch(False)
 
     async def _async_source_active(self, mode: HVACMode, demand: float) -> None:
+        await self._async_switch(True)
+
+    async def _async_source_command(self, mode: HVACMode, command: dict[str, Any]) -> None:
         await self._async_switch(True)
 
     async def _async_source_idle(self, mode: HVACMode) -> None:

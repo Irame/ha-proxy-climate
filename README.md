@@ -1,6 +1,6 @@
 # Proxy Climate for Home Assistant
 
-A climate entity that sits in front of a device you already have in Home Assistant and turns it into a proper thermostat. It reads the room temperature from another entity and uses a deadband so the device doesn't flip on and off all the time. Two kinds of device are supported:
+A climate entity that sits in front of a device you already have in Home Assistant and turns it into a proper thermostat. It reads the room temperature from another entity and uses a deadband so the device doesn't flip on and off all the time. Optionally it hands the decision to an external optimizer in an `auto` mode. Two kinds of device are supported:
 
 * **AC / heat pump** (a `climate` entity): runs the unit at a fixed extreme setpoint while it is working and controls how hard it works through the unit's fan speed.
 * **Space heater or cooler on a switch** (a `switch` or `input_boolean` entity, e.g. a smart plug): switches it on while working and off while idle.
@@ -99,6 +99,33 @@ While running, an AC gets `heat_setpoint` / `cool_setpoint` and a fan level of `
 The proxy's low mode shifts everything one level down (so it never reaches the top speed), high shifts one level up (so it never drops to the quietest).
 
 When idle, `idle_action` decides what the AC does: `turn_off` switches it off, `fan_only` leaves the fan circulating on the quietest level, and `hold_setpoint` keeps it in heat/cool mode but sets the setpoint to the opposite extreme so it idles on its own sensor, which avoids the startup delay some units have after a full power-off.
+
+## Auto mode: letting an optimizer decide
+
+Set `optimizer_url` and the entity also offers `auto`. In auto mode the proxy asks an external service, on every `control_interval` tick, what the device should do, and does it. The proxy's target temperature and fan mode are sent along as the user's wishes; how the service turns them into a decision is up to it.
+
+```yaml
+    optimizer_url: http://climate-optimizer:8099   # base URL; the proxy posts to /api/v1/command
+    # optimizer_token: !secret climate_optimizer  # sent as "Authorization: Bearer ..."
+    # optimizer_timeout: "00:00:05"
+    # auto_fallback: heat                         # heat | cool | off, default: the first mode
+```
+
+The request is a JSON object describing the proxy: `entity_id`, `name`, `source`, `source_domain`, `sensor`, `modes`, `current_temperature`, `target_temperature`, `running`, `run_mode`, `last_switch`, `min_cycle_s` and `control_interval_s`; an AC source adds `source_fan_modes`, `source_fan_mode`, `fan_mode`, `fan_mode_offset`, `fan_modes` and `idle_action`.
+
+The answer:
+
+```json
+{"hvac_mode": "heat", "fan_level": 2, "valid_until": "2026-10-27T10:05:00+00:00", "reason": "cheap hour"}
+```
+
+* `hvac_mode`: `heat` or `cool` (one of the entity's modes) to run the device, `off` to idle it the usual way (`idle_action`).
+* `fan_level`: index into `source_fan_modes`, 0 being the quietest; clamped to the list. Without it the device keeps its current level, or starts at the quietest. Switch sources ignore it.
+* `valid_until`: how long the answer may be followed if no newer one arrives. Default: two control intervals.
+* `follow: false` hands the decision back to the proxy, for an optimizer that is only watching.
+* `reason`: shown as the `optimizer_reason` attribute.
+
+`min_cycle_duration` still applies to the optimizer's starts and stops. If the service can't be reached or answers something unusable, the last answer is followed until it expires; after that, and after `follow: false`, the built-in thermostat runs in `auto_fallback` around the target temperature, exactly as in heat or cool mode. The `optimizer` attribute says which of these is happening: `following`, `unreachable`, `stale` or `deferred`; `run_mode` says whether the device is heating or cooling.
 
 ## Notes
 

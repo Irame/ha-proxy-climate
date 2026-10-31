@@ -250,3 +250,35 @@ async def test_config_checks(hass, fake_ac):
     await hass.async_block_till_done()
     assert hass.states.get("climate.proxy") is None, "auto_fallback without optimizer_url"
     assert hass.states.get("climate.wrong") is None, "auto_fallback outside the modes"
+
+
+async def test_update_entity_asks_at_once(hass, fake_switch, aioclient_mock):
+    """The optimizer has the proxy ask now (homeassistant.update_entity), not at its tick."""
+    assert await async_setup_component(hass, "homeassistant", {})
+    _answer(aioclient_mock, hvac_mode="off")
+    await _setup_heater(hass)
+    await _call(hass, "set_hvac_mode", hvac_mode="auto")
+    assert fake_switch.calls == [] or fake_switch.calls[-1] == "off"
+    _answer(aioclient_mock, hvac_mode="heat", force=True)
+    await hass.services.async_call("homeassistant", "update_entity", {"entity_id": "climate.proxy"}, blocking=True)
+    await hass.async_block_till_done()
+    assert aioclient_mock.call_count == 1
+    assert fake_switch.calls[-1] == "on"
+
+
+async def test_force_starts_past_min_cycle(hass, fake_ac, aioclient_mock, freezer):
+    _answer(aioclient_mock, hvac_mode="heat", fan_level=1)
+    await _setup_ac(hass, min_cycle_duration={"minutes": 5})
+    await _call(hass, "set_hvac_mode", hvac_mode="auto")
+    freezer.tick(timedelta(minutes=6))
+    _answer(aioclient_mock, hvac_mode="off")
+    await _tick(hass, 0)
+    assert _ac(hass)[0] == "off"
+    freezer.tick(timedelta(minutes=1))
+    _answer(aioclient_mock, hvac_mode="heat", fan_level=1)
+    await _tick(hass, 0)
+    assert _ac(hass)[0] == "off", "min off-time holds an ordinary start"
+    freezer.tick(timedelta(minutes=1))
+    _answer(aioclient_mock, hvac_mode="heat", fan_level=1, force=True)
+    await _tick(hass, 0)
+    assert _ac(hass)[0] == "heat", "a forced start does not wait"

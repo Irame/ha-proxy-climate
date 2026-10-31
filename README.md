@@ -124,8 +124,11 @@ The answer:
 * `valid_until`: how long the answer may be followed if no newer one arrives. Default: two control intervals.
 * `follow: false` hands the decision back to the proxy, for an optimizer that is only watching.
 * `reason`: shown as the `optimizer_reason` attribute.
+* `force: true`: start or stop now, past `min_cycle_duration`, for something a person asked for (a heater run on a button).
 
-`min_cycle_duration` still applies to the optimizer's starts and stops. If the service can't be reached or answers something unusable, the last answer is followed until it expires; after that, and after `follow: false`, the built-in thermostat runs in `auto_fallback` around the target temperature, exactly as in heat or cool mode. The `optimizer` attribute says which of these is happening: `following`, `unreachable`, `stale` or `deferred`; `run_mode` says whether the device is heating or cooling.
+`homeassistant.update_entity` on the proxy makes it ask now instead of at its next tick; the optimizer calls it when someone asks for something, so it happens at once.
+
+`min_cycle_duration` still applies to the optimizer's starts and stops, unless the answer says `force`. If the service can't be reached or answers something unusable, the last answer is followed until it expires; after that, and after `follow: false`, the built-in thermostat runs in `auto_fallback` around the target temperature, exactly as in heat or cool mode. The `optimizer` attribute says which of these is happening: `following`, `unreachable`, `stale` or `deferred`; `run_mode` says whether the device is heating or cooling.
 
 ## Notes
 

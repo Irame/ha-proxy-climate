@@ -367,6 +367,14 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         if came_back:
             await self._async_control()
 
+    async def async_update(self) -> None:
+        """homeassistant.update_entity: in auto, ask the optimizer now rather than
+        at the next tick, and act on it. The optimizer uses it to start what someone
+        asked for at once."""
+        if self._started and self._attr_hvac_mode == HVACMode.AUTO:
+            await self._async_fetch_command()
+            await self._async_control()
+
     async def _async_tick(self, _now: datetime) -> None:
         # The optimizer is asked on the tick only; sensor updates in between
         # reuse its last answer.
@@ -413,7 +421,8 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
 
         if mode == HVACMode.AUTO:
             if (command := self._valid_command()) is not None:
-                await self._async_follow(command, force)
+                # force: someone asked for this run, past min_cycle_duration
+                await self._async_follow(command, force or command.get("force") is True)
                 return
             # No fresh answer: the built-in thermostat takes over.
             mode = self._auto_fallback

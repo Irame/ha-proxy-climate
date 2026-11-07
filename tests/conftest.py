@@ -27,7 +27,7 @@ class FakeAC(ClimateEntity):
     _attr_should_poll = False
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.FAN_ONLY]
-    _attr_fan_modes = ["quiet", "low", "mid", "high"]
+    _attr_fan_modes = ["quiet", "low", "mid", "high", "auto"]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.FAN_MODE

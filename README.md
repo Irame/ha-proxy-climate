@@ -26,7 +26,7 @@ climate:
     unique_id: proxy_climate_living_room
     source: climate.living_room_ac          # the real AC entity
     sensor: sensor.living_room_temperature  # sensor or climate entity (uses current_temperature)
-    source_fan_modes: [quiet, low, mid, high]  # weakest -> strongest, exactly as the AC names them
+    source_fan_modes: [quiet, low, mid, high]  # weakest -> strongest, exactly as the AC names them (not with power_control: setpoint)
 
     # everything below is optional (defaults shown)
     hvac_modes: [heat, cool]
@@ -98,6 +98,21 @@ While running, an AC gets `heat_setpoint` / `cool_setpoint` and a fan level of `
 
 The proxy's low mode shifts everything one level down (so it never reaches the top speed), high shifts one level up (so it never drops to the quietest).
 
+### Setpoint power control
+
+Some inverter units follow the gap between their setpoint and their own reading much more than the fan speed. With `power_control: setpoint` the levels are that gap instead: the AC gets a setpoint a few degrees past what it measures itself, and the fan is left at one mode (e.g. its `auto`).
+
+```yaml
+    power_control: setpoint         # fan (default) | setpoint
+    setpoint_offsets: [1, 2, 3, 4]  # one level each, weakest first: degrees above (heat) / below (cool) the AC's reading
+    setpoint_fan_mode: auto         # optional: the AC's fan mode while running; left as it is if not set
+    # source_fan_modes is not needed here
+```
+
+If the AC reads 24° and the demand asks for the second level, it gets 26° to heat (22° to cool). The proxy uses the AC's own `current_temperature`, not the room sensor, because that is what the AC compares its setpoint with; only if the AC reports none does it fall back to the room sensor (with a warning in the log). The setpoint is rounded away from the room onto the AC's `target_temp_step` (never less than the level asks) and kept within its `min_temp` / `max_temp`. It follows the AC's reading as it changes, at once towards more; a setpoint up to one step past the ideal one is kept, so a reading flickering between two values doesn't send a command each time.
+
+Levels are chosen exactly as with fan speeds (`fan_step`, `fan_hysteresis`, `fan_mode_offsets`, an optimizer's `fan_level`), the entity's `source_fan_mode` attribute shows the level as `+2 K`, and `heat_setpoint` / `cool_setpoint` don't apply while running. When idle, `idle_action` works as described below.
+
 When idle, `idle_action` decides what the AC does: `turn_off` switches it off, `fan_only` leaves the fan circulating on the quietest level, and `hold_setpoint` keeps it in heat/cool mode but sets the setpoint to the opposite extreme so it idles on its own sensor, which avoids the startup delay some units have after a full power-off.
 
 ## Auto mode: letting an optimizer decide
@@ -111,7 +126,7 @@ Set `optimizer_url` and the entity also offers `auto`. In auto mode the proxy as
     # auto_fallback: heat                         # heat | cool | off, default: the first mode
 ```
 
-The request is a JSON object describing the proxy: `entity_id`, `name`, `source`, `source_domain`, `sensor`, `modes`, `current_temperature`, `target_temperature`, `running`, `run_mode`, `last_switch`, `min_cycle_s` and `control_interval_s`; an AC source adds `source_fan_modes`, `source_fan_mode`, `fan_mode`, `fan_mode_offset`, `fan_modes` and `idle_action`.
+The request is a JSON object describing the proxy: `entity_id`, `name`, `source`, `source_domain`, `sensor`, `modes`, `current_temperature`, `target_temperature`, `running`, `run_mode`, `last_switch`, `min_cycle_s` and `control_interval_s`; an AC source adds `source_fan_modes` (the levels: fan modes, or `+N K` with setpoint power control), `source_fan_mode`, `power_control`, `setpoint_offsets` (setpoint power control only), `fan_mode`, `fan_mode_offset`, `fan_modes` and `idle_action`.
 
 The answer:
 
@@ -120,7 +135,7 @@ The answer:
 ```
 
 * `hvac_mode`: `heat` or `cool` (one of the entity's modes) to run the device, `off` to idle it the usual way (`idle_action`).
-* `fan_level`: index into `source_fan_modes`, 0 being the quietest; clamped to the list. Without it the device keeps its current level, or starts at the quietest. Switch sources ignore it.
+* `fan_level`: index into `source_fan_modes` (or `setpoint_offsets`), 0 being the weakest; clamped to the list. Without it the device keeps its current level, or starts at the quietest. Switch sources ignore it.
 * `valid_until`: how long the answer may be followed if no newer one arrives. Default: two control intervals.
 * `follow: false` hands the decision back to the proxy, for an optimizer that is only watching.
 * `reason`: shown as the `optimizer_reason` attribute.
@@ -138,7 +153,7 @@ If the room sensor becomes unavailable, the proxy goes idle until readings come 
 
 Target temperature, mode, fan mode, and whether a cycle was in progress are restored after a restart.
 
-On many inverter units the compressor follows the gap between its setpoint and its own internal sensor, so fan speed only partly limits output. If you see icing in cooling, high-pressure trips in heating, or noisy operation, use less extreme `heat_setpoint` / `cool_setpoint` values (e.g. 26 / 20).
+On many inverter units the compressor follows the gap between its setpoint and its own internal sensor, so fan speed only partly limits output. If you see icing in cooling, high-pressure trips in heating, or noisy operation, use less extreme `heat_setpoint` / `cool_setpoint` values (e.g. 26 / 20), or setpoint power control.
 
 For troubleshooting, enable debug logging; every start/stop decision and every command sent to the device is logged:
 

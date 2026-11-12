@@ -179,9 +179,10 @@ CLIMATE_SOURCE_SCHEMA = _COMMON_SCHEMA.extend(
         vol.Optional(CONF_SETPOINT_OFFSETS, default=[1.0, 2.0, 3.0, 4.0]): vol.All(
             cv.ensure_list, [vol.All(vol.Coerce(float), vol.Range(min=0, max=15))], vol.Length(min=1)
         ),
-        # The AC's fan mode while running under setpoint control (e.g. auto).
+        # The AC's fan mode while running under setpoint control: one for every
+        # level (e.g. auto), or a list with one per offset (quiet, low, ...).
         # Default: left as it is.
-        vol.Optional(CONF_SETPOINT_FAN_MODE): cv.string,
+        vol.Optional(CONF_SETPOINT_FAN_MODE): vol.Any(cv.string, [cv.string]),
         vol.Optional(
             CONF_HVAC_MODES, default=[HVACMode.HEAT, HVACMode.COOL]
         ): vol.All(
@@ -236,6 +237,9 @@ def _validate_platform(config: ConfigType) -> ConfigType:
         offsets = config[CONF_SETPOINT_OFFSETS]
         if config[CONF_POWER_CONTROL] == POWER_SETPOINT and any(b < a for a, b in zip(offsets, offsets[1:])):
             raise vol.Invalid(f"{CONF_SETPOINT_OFFSETS} go from the weakest level to the strongest")
+        fans = config.get(CONF_SETPOINT_FAN_MODE)
+        if isinstance(fans, list) and len(fans) != len(offsets):
+            raise vol.Invalid(f"{CONF_SETPOINT_FAN_MODE}: one fan mode for each of the {len(offsets)} {CONF_SETPOINT_OFFSETS}")
     else:
         config = SWITCH_SOURCE_SCHEMA(config)
         modes = [config[CONF_HVAC_MODE]]
@@ -743,13 +747,16 @@ class ProxyClimate(BaseProxyClimate):
         self._source_fan_modes: list[str] = config.get(CONF_SOURCE_FAN_MODES) or []
         self._power: str = config[CONF_POWER_CONTROL]
         self._sp_offsets: list[float] = list(config[CONF_SETPOINT_OFFSETS])
-        self._sp_fan: str | None = config.get(CONF_SETPOINT_FAN_MODE)
+        fans = config.get(CONF_SETPOINT_FAN_MODE)
+        # the AC's fan mode at each level under setpoint control (None: left as it is)
+        self._sp_fans: list[str | None] = list(fans) if isinstance(fans, list) else [fans] * len(self._sp_offsets)
         self._sensor_fallback_warned = False
-        # the levels the optimizer and the built-in curve choose from, weakest first
+        # the levels the optimizer and the built-in curve choose from, weakest first;
+        # under setpoint control "+2 K", or "+2 K low" with a fan mode per level
         self._levels: list[str] = (
             self._source_fan_modes
             if self._power == POWER_FAN
-            else [f"+{o:g} K" for o in self._sp_offsets]
+            else [f"+{o:g} K" + (f" {f}" if isinstance(fans, list) else "") for o, f in zip(self._sp_offsets, self._sp_fans)]
         )
         self._heat_sp: float | None = config.get(CONF_HEAT_SETPOINT)
         self._cool_sp: float | None = config.get(CONF_COOL_SETPOINT)
@@ -784,7 +791,7 @@ class ProxyClimate(BaseProxyClimate):
         available = state.attributes.get(ATTR_FAN_MODES) if state else None
         if not available:
             return
-        wanted = self._source_fan_modes if self._power == POWER_FAN else [self._sp_fan] if self._sp_fan else []
+        wanted = self._source_fan_modes if self._power == POWER_FAN else sorted({f for f in self._sp_fans if f})
         missing = [m for m in wanted if m not in available]
         if missing:
             _LOGGER.warning(
@@ -866,7 +873,7 @@ class ProxyClimate(BaseProxyClimate):
         else:
             setpoint = self._level_setpoint(mode, level)
             self._sp_run = (mode, level)
-            await self._async_apply_source(mode, setpoint, self._sp_fan)
+            await self._async_apply_source(mode, setpoint, self._sp_fans[level])
 
     def _level_setpoint(self, mode: HVACMode, level: int) -> float:
         """The AC's own reading, plus the level's offset (minus, cooling), on its
@@ -917,7 +924,8 @@ class ProxyClimate(BaseProxyClimate):
             "source_fan_modes": self._levels,
             "source_fan_mode": self._source_fan,
             "power_control": self._power,
-            **({"setpoint_offsets": self._sp_offsets} if self._power == POWER_SETPOINT else {}),
+            **({"setpoint_offsets": self._sp_offsets, "setpoint_fan_modes": self._sp_fans}
+               if self._power == POWER_SETPOINT else {}),
             "fan_mode": self._attr_fan_mode,
             "fan_mode_offset": self._fan_offsets.get(self._attr_fan_mode or "", 0),
             "fan_modes": self._attr_fan_modes,
@@ -925,7 +933,7 @@ class ProxyClimate(BaseProxyClimate):
         }
 
     async def _async_source_idle(self, mode: HVACMode) -> None:
-        quietest = self._source_fan_modes[0] if self._power == POWER_FAN else self._sp_fan
+        quietest = self._source_fan_modes[0] if self._power == POWER_FAN else self._sp_fans[0]
         self._sp_run = None
         if self._idle_action == IDLE_TURN_OFF:
             self._source_fan = None

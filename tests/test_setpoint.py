@@ -111,3 +111,23 @@ async def test_setpoint_config_checks(hass, fake_ac):
         assert await async_setup_component(hass, "climate", {"climate": [{"platform": "fake_ac"}, {**cfg, "name": f"bad{i}"}]})
     await hass.async_block_till_done()
     assert hass.states.get("climate.bad0") is None and hass.states.get("climate.bad1") is None
+
+
+async def test_a_fan_mode_per_level(hass, fake_ac, aioclient_mock):
+    """Both levers: each level its setpoint offset and its own fan speed."""
+    aioclient_mock.post(COMMAND, json={"hvac_mode": "heat", "fan_level": 2})
+    await _setup(hass, fake_ac, optimizer_url=URL, setpoint_fan_mode=["quiet", "low", "mid", "high"])
+    await _call(hass, "set_hvac_mode", hvac_mode="auto")
+    assert _ac(hass) == ("heat", 27, "mid")  # its own 24 °C + 3 K, at the third fan speed
+    body = aioclient_mock.mock_calls[-1][2]
+    assert body["source_fan_modes"] == ["+1 K quiet", "+2 K low", "+3 K mid", "+4 K high"]
+    assert body["setpoint_fan_modes"] == ["quiet", "low", "mid", "high"]
+    assert hass.states.get("climate.proxy").attributes["source_fan_mode"] == "+3 K mid"
+
+
+async def test_one_fan_mode_per_offset(hass, fake_ac):
+    hass.states.async_set("sensor.room", "21.0")
+    cfg = {**SP, "name": "bad", "setpoint_fan_mode": ["quiet", "low"]}  # four offsets, two fan modes
+    assert await async_setup_component(hass, "climate", {"climate": [{"platform": "fake_ac"}, cfg]})
+    await hass.async_block_till_done()
+    assert hass.states.get("climate.bad") is None

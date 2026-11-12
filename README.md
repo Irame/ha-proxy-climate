@@ -106,12 +106,13 @@ Some inverter units follow the gap between their setpoint and their own reading 
     power_control: setpoint         # fan (default) | setpoint
     setpoint_offsets: [1, 2, 3, 4]  # one level each, weakest first: degrees above (heat) / below (cool) the AC's reading
     setpoint_fan_mode: auto         # optional: the AC's fan mode while running; left as it is if not set
+    # setpoint_fan_mode: [quiet, low, medium, high]  # or one per offset: each level both levers
     # source_fan_modes is not needed here
 ```
 
-If the AC reads 24° and the demand asks for the second level, it gets 26° to heat (22° to cool). The proxy uses the AC's own `current_temperature`, not the room sensor, because that is what the AC compares its setpoint with; only if the AC reports none does it fall back to the room sensor (with a warning in the log). The setpoint is rounded away from the room onto the AC's `target_temp_step` (never less than the level asks) and kept within its `min_temp` / `max_temp`. It follows the AC's reading as it changes, at once towards more; a setpoint up to one step past the ideal one is kept, so a reading flickering between two values doesn't send a command each time.
+If the AC reads 24° and the demand asks for the second level, it gets 26° to heat (22° to cool). With a fan mode per level, it also gets that level's fan speed: with `auto`, a unit whose own reading runs ahead of the room (warm air gathering at its intake) slows its fan as the gap closes, which gathers more warmth there; a fixed speed per level keeps the air moving. The proxy uses the AC's own `current_temperature`, not the room sensor, because that is what the AC compares its setpoint with; only if the AC reports none does it fall back to the room sensor (with a warning in the log). The setpoint is rounded away from the room onto the AC's `target_temp_step` (never less than the level asks) and kept within its `min_temp` / `max_temp`. It follows the AC's reading as it changes, at once towards more; a setpoint up to one step past the ideal one is kept, so a reading flickering between two values doesn't send a command each time.
 
-Levels are chosen exactly as with fan speeds (`fan_step`, `fan_hysteresis`, `fan_mode_offsets`, an optimizer's `fan_level`), the entity's `source_fan_mode` attribute shows the level as `+2 K`, and `heat_setpoint` / `cool_setpoint` don't apply while running. When idle, `idle_action` works as described below.
+Levels are chosen exactly as with fan speeds (`fan_step`, `fan_hysteresis`, `fan_mode_offsets`, an optimizer's `fan_level`), the entity's `source_fan_mode` attribute shows the level as `+2 K` (`+2 K low` with a fan mode per level), and `heat_setpoint` / `cool_setpoint` don't apply while running. When idle, `idle_action` works as described below.
 
 When idle, `idle_action` decides what the AC does: `turn_off` switches it off, `fan_only` leaves the fan circulating on the quietest level, and `hold_setpoint` keeps it in heat/cool mode but sets the setpoint to the opposite extreme so it idles on its own sensor, which avoids the startup delay some units have after a full power-off.
 
@@ -126,7 +127,7 @@ Set `optimizer_url` and the entity also offers `auto`. In auto mode the proxy as
     # auto_fallback: heat                         # heat | cool | off, default: the first mode
 ```
 
-The request is a JSON object describing the proxy: `entity_id`, `name`, `source`, `source_domain`, `sensor`, `modes`, `current_temperature`, `target_temperature`, `running`, `run_mode`, `last_switch`, `min_cycle_s` and `control_interval_s`; an AC source adds `source_fan_modes` (the levels: fan modes, or `+N K` with setpoint power control), `source_fan_mode`, `power_control`, `setpoint_offsets` (setpoint power control only), `fan_mode`, `fan_mode_offset`, `fan_modes` and `idle_action`.
+The request is a JSON object describing the proxy: `entity_id`, `name`, `source`, `source_domain`, `sensor`, `modes`, `current_temperature`, `target_temperature`, `running`, `run_mode`, `last_switch`, `min_cycle_s` and `control_interval_s`; an AC source adds `source_fan_modes` (the levels: fan modes, or `+N K` with setpoint power control), `source_fan_mode`, `power_control`, `setpoint_offsets` and `setpoint_fan_modes` (setpoint power control only), `fan_mode`, `fan_mode_offset`, `fan_modes` and `idle_action`.
 
 The answer:
 

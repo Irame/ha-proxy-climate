@@ -152,7 +152,9 @@ While the proxy is in heat or cool, it owns the device: anything changed with th
 
 If the room sensor becomes unavailable, the proxy goes idle until readings come back, so the device is never left running without feedback.
 
-Target temperature, mode, fan mode, and whether a cycle was in progress are restored after a restart.
+Target temperature, mode, fan mode, whether a cycle was in progress, when it last started or stopped (so `min_cycle_duration` holds across a restart), and a turn-off that had not reached the device yet are restored after a restart.
+
+A command the device has not shown yet is not sent again for 90 seconds: a cloud-connected AC often shows a change only at its next poll, and many beep at every command. A device that is unavailable starts no cycle and does not count as running. A switch between heating and cooling asked for by the optimizer is not held back by `min_cycle_duration`.
 
 On many inverter units the compressor follows the gap between its setpoint and its own internal sensor, so fan speed only partly limits output. If you see icing in cooling, high-pressure trips in heating, or noisy operation, use less extreme `heat_setpoint` / `cool_setpoint` values (e.g. 26 / 20), or setpoint power control.
 

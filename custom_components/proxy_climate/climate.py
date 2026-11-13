@@ -122,6 +122,11 @@ ATTR_FAN_MODES = "fan_modes"
 ATTR_HVAC_ACTION = "hvac_action"
 ATTR_CURRENT_TEMPERATURE = "current_temperature"
 ATTR_LAST_ON_MODE = "last_on_mode"
+ATTR_LAST_SWITCH = "last_switch"
+ATTR_PENDING_OFF = "pending_off"
+# A command the source has not shown yet is not sent again before this (a cloud-polled
+# AC shows a change only at its next poll, and beeps at every command)
+RESEND_AFTER = timedelta(seconds=90)
 ATTR_RUN_MODE = "run_mode"
 
 DEFAULT_FAN_OFFSETS = {"low": -1, "medium": 0, "high": 1}
@@ -315,6 +320,7 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         self._demand: float | None = None
         self._pending_off = False  # turn-off that hasn't reached the source yet
         self._started = False
+        self._awaiting_answer = False  # switched to auto: the optimizer's first answer is on its way
         self._lock = asyncio.Lock()
 
         # Auto mode: the mode the source is actually run in, and the last
@@ -360,6 +366,9 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
             self._attr_target_temperature = float(temp)
         if (last := old.attributes.get(ATTR_LAST_ON_MODE)) in self._modes:
             self._last_on_mode = HVACMode(last)
+        if (sw := old.attributes.get(ATTR_LAST_SWITCH)) and (when := dt_util.parse_datetime(str(sw))):
+            self._last_switch = when  # min_cycle_duration holds across a restart
+        self._pending_off = bool(old.attributes.get(ATTR_PENDING_OFF))
         # Resume an in-progress cycle instead of waiting for the start threshold.
         action = old.attributes.get(ATTR_HVAC_ACTION)
         self._active = action in (HVACAction.HEATING, HVACAction.COOLING)
@@ -371,9 +380,9 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         self._attr_current_temperature = self._read_temperature(
             self.hass.states.get(self._sensor)
         )
-        self._started = True
         if self._attr_hvac_mode == HVACMode.AUTO:
-            await self._async_fetch_command()
+            await self._async_fetch_command()  # before acting: a sensor event meanwhile waits for it
+        self._started = True
         await self._async_control()
 
     # -------------------------------------------------------------- listeners
@@ -405,6 +414,8 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
     async def _async_tick(self, _now: datetime) -> None:
         # The optimizer is asked on the tick only; sensor updates in between
         # reuse its last answer.
+        if not self._started:
+            return
         if self._attr_hvac_mode == HVACMode.AUTO:
             await self._async_fetch_command()
         await self._async_control()
@@ -419,15 +430,16 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
             else state.state
         )
         try:
-            return float(raw)
+            value = float(raw)
         except (TypeError, ValueError):
             return None
+        return value if math.isfinite(value) else None  # "nan" or "inf": no reading
 
     # ---------------------------------------------------------- control logic
 
     async def _async_control(self, force: bool = False) -> None:
         """Re-evaluate and push the desired state to the source."""
-        if not self._started:
+        if not self._started or self._awaiting_answer:
             return
         async with self._lock:
             await self._async_control_locked(force)
@@ -479,7 +491,7 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         self._demand = round(demand, 2)
 
         if not self._active and demand >= self._start_offset:
-            if force or self._cycle_allowed():
+            if (force or self._cycle_allowed()) and self._source_available():
                 self._set_active(True)
         elif self._active and demand <= -self._stop_offset:
             if force or self._cycle_allowed():
@@ -513,11 +525,10 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
             await self._async_stop_or_hold(force)
             return
         run = HVACMode(want)
-        if self._active and self._run_mode != run:
-            # heat <-> cool: the running cycle belongs to the other mode
-            self._set_active(False)
+        # heat <-> cool while running: the cycle goes on in the other mode (no stop and
+        # start, which min_cycle_duration would hold apart)
         self._run_mode = run
-        if not self._active and (force or self._cycle_allowed()):
+        if not self._active and (force or self._cycle_allowed()) and self._source_available():
             self._set_active(True)
         if self._active:
             await self._async_source_command(run, command)
@@ -646,7 +657,12 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
 
     def _is_running(self) -> bool:
         """Whether the source is heating/cooling right now."""
-        return self._active
+        return self._active and self._source_available()
+
+    def _source_available(self) -> bool:
+        """A source that is unavailable cannot start a cycle (nor count as running)."""
+        state = self.hass.states.get(self._source)
+        return state is not None and state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN)
 
     async def _async_call(self, service: str, data: dict[str, Any]) -> bool:
         domain = self._source_domain
@@ -682,7 +698,10 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         attrs: dict[str, Any] = {
             "demand": self._demand,
             ATTR_LAST_ON_MODE: self._last_on_mode,
+            ATTR_LAST_SWITCH: self._last_switch.isoformat() if self._last_switch else None,
         }
+        if self._pending_off:
+            attrs[ATTR_PENDING_OFF] = True
         if self._attr_hvac_mode == HVACMode.AUTO:
             attrs["optimizer"] = self._optimizer_state
             attrs["optimizer_reason"] = self._optimizer_reason
@@ -700,7 +719,11 @@ class BaseProxyClimate(ClimateEntity, RestoreEntity):
         if hvac_mode in self._modes:
             self._last_on_mode = hvac_mode
         if hvac_mode == HVACMode.AUTO and changed and self._started:
-            await self._async_fetch_command()
+            self._awaiting_answer = True  # a sensor event meanwhile must not start the fallback thermostat
+            try:
+                await self._async_fetch_command()
+            finally:
+                self._awaiting_answer = False
         # Re-sending the current mode must not skip min_cycle_duration, but
         # "off" always goes through so it also stops a source switched on by hand.
         await self._async_control(force=changed or hvac_mode == HVACMode.OFF)
@@ -773,6 +796,7 @@ class ProxyClimate(BaseProxyClimate):
 
         self._base_level: int | None = None  # source fan level before offset
         self._source_fan: str | None = None
+        self._sent: dict[str, tuple[Any, datetime]] = {}  # per command: the value last sent, and when
         self._sp_run: tuple[HVACMode, int] | None = None  # power_control: setpoint, the run in force
 
     # ------------------------------------------------------------------ setup
@@ -980,10 +1004,8 @@ class ProxyClimate(BaseProxyClimate):
         base = {ATTR_ENTITY_ID: self._source}
         ok = True
 
-        if state.state != hvac_mode:
-            ok &= await self._async_call(
-                "set_hvac_mode", {**base, ATTR_HVAC_MODE: hvac_mode}
-            )
+        if state.state != hvac_mode and not self._just_sent("mode", hvac_mode):
+            ok &= await self._async_send("mode", hvac_mode, "set_hvac_mode", {**base, ATTR_HVAC_MODE: hvac_mode})
 
         if temperature is not None:
             current_sp = state.attributes.get(ATTR_TEMPERATURE)
@@ -991,15 +1013,22 @@ class ProxyClimate(BaseProxyClimate):
                 same = abs(float(current_sp) - temperature) < 0.01
             except (TypeError, ValueError):
                 same = False
-            if not same:
-                ok &= await self._async_call(
-                    "set_temperature", {**base, ATTR_TEMPERATURE: temperature}
-                )
+            if not same and not self._just_sent("temp", temperature):
+                ok &= await self._async_send("temp", temperature, "set_temperature", {**base, ATTR_TEMPERATURE: temperature})
 
-        if fan_mode is not None and state.attributes.get(ATTR_FAN_MODE) != fan_mode:
-            ok &= await self._async_call(
-                "set_fan_mode", {**base, ATTR_FAN_MODE: fan_mode}
-            )
+        if fan_mode is not None and state.attributes.get(ATTR_FAN_MODE) != fan_mode and not self._just_sent("fan", fan_mode):
+            ok &= await self._async_send("fan", fan_mode, "set_fan_mode", {**base, ATTR_FAN_MODE: fan_mode})
+        return ok
+
+    def _just_sent(self, kind: str, value: Any) -> bool:
+        """The same was sent a moment ago and the source has not shown it yet: not again."""
+        last = self._sent.get(kind)
+        return last is not None and last[0] == value and dt_util.utcnow() - last[1] < RESEND_AFTER
+
+    async def _async_send(self, kind: str, value: Any, service: str, data: dict[str, Any]) -> bool:
+        ok = await self._async_call(service, data)
+        if ok:
+            self._sent[kind] = (value, dt_util.utcnow())
         return ok
 
     # ------------------------------------------------------------ entity API

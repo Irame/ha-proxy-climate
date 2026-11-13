@@ -40,24 +40,28 @@ class FakeAC(ClimateEntity):
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.lazy = False  # takes commands without showing them (a cloud AC between polls)
         self._attr_hvac_mode = HVACMode.OFF
         self._attr_fan_mode = "mid"
         self._attr_target_temperature = 22
 
     async def async_set_hvac_mode(self, hvac_mode):
         self.calls.append(("mode", hvac_mode))
-        self._attr_hvac_mode = hvac_mode
-        self.async_write_ha_state()
+        if not self.lazy:
+            self._attr_hvac_mode = hvac_mode
+            self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs):
         self.calls.append(("temp", kwargs[ATTR_TEMPERATURE]))
-        self._attr_target_temperature = kwargs[ATTR_TEMPERATURE]
-        self.async_write_ha_state()
+        if not self.lazy:
+            self._attr_target_temperature = kwargs[ATTR_TEMPERATURE]
+            self.async_write_ha_state()
 
     async def async_set_fan_mode(self, fan_mode):
         self.calls.append(("fan", fan_mode))
-        self._attr_fan_mode = fan_mode
-        self.async_write_ha_state()
+        if not self.lazy:
+            self._attr_fan_mode = fan_mode
+            self.async_write_ha_state()
 
     async def async_turn_on(self):
         await self.async_set_hvac_mode(HVACMode.HEAT)
